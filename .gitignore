@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+
+# VSCode / PyCharm
+.vscode/
+.idea/
+
+# Logs
+*.log
+
