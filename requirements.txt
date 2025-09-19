@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+google-cloud-bigquery
+google-cloud-storage
+google-cloud-secret-manager
+langchain
+langchain-google-vertexai
+langgraph
+vertexai
+requests
+pydantic
+

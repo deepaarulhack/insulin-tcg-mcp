@@ -33,7 +33,7 @@ def access_secret(secret_name: str) -> str:
         request={"name": name}
     ).payload.data.decode("UTF-8")
 
-# Jira secrets (not used yet in this step)
+# Jira secrets
 JIRA_USER = access_secret("jira-user")
 JIRA_TOKEN = access_secret("jira-token")
 JIRA_URL = access_secret("jira-url")
@@ -69,6 +69,31 @@ class ISOResult(BaseModel):
     related_iso_refs: List[str]
     suggestions: str
 
+class PytestRequest(BaseModel):
+    req_id: str
+    test_case_ids: List[str]
+
+class PytestResult(BaseModel):
+    test_case_id: str
+    pytest_path: str
+
+class SamplesRequest(BaseModel):
+    req_id: str
+    test_case_ids: List[str]
+
+class SamplesResult(BaseModel):
+    test_case_id: str
+    sample_path: str
+
+class JiraRequest(BaseModel):
+    req_id: str
+    test_case_ids: List[str]
+    run_id: str | None = None
+
+class JiraResponse(BaseModel):
+    issue_key: str
+    url: str
+
 # ============================
 # LangGraph Agent + Tools
 # ============================
@@ -77,6 +102,22 @@ class RequirementInput(BaseModel):
 
 class TestcaseInput(BaseModel):
     req_id: str
+
+class ISOInput(BaseModel):
+    test_case_ids: List[str]
+
+class PytestInput(BaseModel):
+    req_id: str
+    test_case_ids: List[str]
+
+class SamplesInput(BaseModel):
+    req_id: str
+    test_case_ids: List[str]
+
+class JiraInput(BaseModel):
+    req_id: str
+    test_case_ids: List[str]
+    run_id: str | None = None
 
 tools = [
     StructuredTool.from_function(
@@ -94,6 +135,38 @@ tools = [
         name="testcase_generator",
         description="Generate test cases for a given requirement ID.",
         args_schema=TestcaseInput
+    ),
+    StructuredTool.from_function(
+        func=lambda test_case_ids: json.dumps(
+            [res for res in iso_validate(ISORequest(test_case_ids=test_case_ids))]
+        ),
+        name="iso_validator",
+        description="Validate test cases against ISO standards.",
+        args_schema=ISOInput
+    ),
+    StructuredTool.from_function(
+        func=lambda req_id, test_case_ids: json.dumps(
+            [res for res in pytest_generate(PytestRequest(req_id=req_id, test_case_ids=test_case_ids))]
+        ),
+        name="pytest_generator",
+        description="Generate pytest scripts for validated test cases.",
+        args_schema=PytestInput
+    ),
+    StructuredTool.from_function(
+        func=lambda req_id, test_case_ids: json.dumps(
+            [res for res in samples_generate(SamplesRequest(req_id=req_id, test_case_ids=test_case_ids))]
+        ),
+        name="sample_generator",
+        description="Generate sample datasets for test cases.",
+        args_schema=SamplesInput
+    ),
+    StructuredTool.from_function(
+        func=lambda req_id, test_case_ids, run_id=None: json.dumps(
+            jira_update(JiraRequest(req_id=req_id, test_case_ids=test_case_ids, run_id=run_id)).dict()
+        ),
+        name="jira_updater",
+        description="Update Jira with test case results.",
+        args_schema=JiraInput
     ),
 ]
 
@@ -124,49 +197,21 @@ def get_repo_context():
 # ============================
 def safe_parse_json(answer_text, requirement_text, req_id):
     try:
-        # Extract JSON array
+        # Extract JSON array if mixed with text
         match = re.search(r"\[.*\]", answer_text, re.DOTALL)
         if match:
             return json.loads(match.group(0))
-
-        # Extract JSON object
-        match = re.search(r"\{.*\}", answer_text, re.DOTALL)
-        if match:
-            return [json.loads(match.group(0))]
-
-        # Direct parse
         return json.loads(answer_text)
-
-    except Exception as e:
-        print("⚠️ JSON parse failed for requirement", req_id)
-        print("⚠️ Raw answer_text:\n", answer_text)
-        print("⚠️ Error:", str(e))
+    except Exception:
+        # Fallback if parsing fails
         return [{
             "test_case_id": f"TC-{uuid.uuid4().hex[:6].upper()}",
             "title": "Fallback test case",
             "description": requirement_text,
             "steps": ["Step 1", "Step 2"],
-            "expected_results": ["Expected outcome"]
+            "expected_results": ["Expected outcome"],
+            "req_id": req_id
         }]
-
-# ============================
-# Normalizer for BigQuery
-# ============================
-def normalize_test_case(tc, req_id):
-    """Ensure all fields match the BigQuery schema."""
-    return {
-        "test_case_id": tc.get("test_case_id", f"TC-{uuid.uuid4().hex[:6].upper()}"),
-        "req_id": req_id,
-        "title": tc.get("title", "Untitled test case"),
-        "description": tc.get("description", ""),
-        "acceptance_criteria": tc.get("acceptance_criteria", []),
-        "preconditions": tc.get("preconditions", []),
-        "steps": list(tc.get("steps", [])),
-        "expected_results": list(tc.get("expected_results", [])),
-        "hazard": tc.get("hazard", ""),
-        "iso_refs": tc.get("iso_refs", []),
-        "created_at": datetime.utcnow().isoformat()
-    }
 
 # ============================
 # Debug Endpoint
@@ -236,51 +281,9 @@ def testcase_generate(req: TestCaseRequest) -> List[TestCaseResponse]:
 
     test_cases = safe_parse_json(answer_text, requirement_text, req.req_id)
 
-    # Normalize for BigQuery schema
-    normalized_cases = [normalize_test_case(tc, req.req_id) for tc in test_cases]
-
     table_ref = "insulin-tcg-mcp.qa_metrics.test_cases"
-    errors = bq.insert_rows_json(table_ref, normalized_cases)
-    if errors:
-        print("⚠️ BigQuery insert error:", errors)
-        raise Exception(f"BigQuery insert error: {errors}")
-
-    return normalized_cases
-
-@app.post("/tools/iso.validate")
-def iso_validate(req: ISORequest) -> List[ISOResult]:
-    results = []
-    for tc_id in req.test_case_ids:
-        # Demo logic: mark last as non-compliant
-        compliant = not tc_id.endswith("3")
-        missing = [] if compliant else ["Acceptance criteria not detailed"]
-        refs = ["ISO 62304 §5.5.1", "ISO 14971 §7.4"]
-        suggestion = "Looks good." if compliant else "Add precise acceptance criteria."
-
-        res = {
-            "test_case_id": tc_id,
-            "compliant": compliant,
-            "missing_elements": missing,
-            "related_iso_refs": refs,
-            "suggestions": suggestion,
-        }
-        results.append(res)
-
-    # Insert into BigQuery
-    table_ref = "insulin-tcg-mcp.qa_metrics.iso_validation"
-    rows = []
-    for r in results:
-        rows.append({
-            "validation_id": f"VAL-{uuid.uuid4().hex[:8].upper()}",
-            **r,
-            "validated_at": datetime.utcnow().isoformat()
-        })
-    errors = bq.insert_rows_json(table_ref, rows)
-    if errors:
-        print("⚠️ BigQuery insert error:", errors)
-        raise Exception(f"BigQuery insert error: {errors}")
-
-    return results
+    bq.insert_rows_json(table_ref, test_cases)
+    return test_cases
 
 @app.get("/")
 def root():
