@@ -1,14 +1,6 @@
-# Python
+venv/
 __pycache__/
 *.pyc
-
-# Virtual env
-venv/
-
-# VSCode / PyCharm
-.vscode/
-.idea/
-
-# Logs
+.env
 *.log
 

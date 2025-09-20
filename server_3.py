@@ -9,7 +9,7 @@ from typing import List, Optional
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from google.cloud import bigquery, storage, secretmanager
+from google.cloud import bigquery, storage
 
 # --------------------------
 # Logging Setup
@@ -23,36 +23,20 @@ logger = logging.getLogger("mcp-server")
 # --------------------------
 # FastAPI app
 # --------------------------
-app = FastAPI(title="Insulin TCG MCP")
+app = FastAPI()
 
 # --------------------------
-# GCP Clients
+# Config
 # --------------------------
-bq = bigquery.Client()
-storage_client = storage.Client()
-bucket_name = f"{bq.project}-tcg"
-bucket = storage_client.bucket(bucket_name)
+PROJECT_ID = os.getenv("PROJECT_ID", "insulin-tcg-mcp")
+BUCKET_NAME = f"{PROJECT_ID}-tcg"
+JIRA_URL = "https://deepaarulhack.atlassian.net"
+JIRA_USER = os.getenv("JIRA_USER")
+JIRA_TOKEN = os.getenv("JIRA_TOKEN")
 
-secret_client = secretmanager.SecretManagerServiceClient()
-
-def access_secret(secret_name: str) -> str:
-    """Fetch latest secret value from Secret Manager"""
-    try:
-        name = f"projects/{bq.project}/secrets/{secret_name}/versions/latest"
-        return secret_client.access_secret_version(
-            request={"name": name}
-        ).payload.data.decode("UTF-8")
-    except Exception as e:
-        logger.error(f"Failed to access secret {secret_name}: {e}")
-        return ""
-
-# --------------------------
-# Jira Config
-# --------------------------
-JIRA_USER = access_secret("jira-user")
-JIRA_TOKEN = access_secret("jira-token")
-JIRA_URL = access_secret("jira-url")
-JIRA_PROJECT_KEY = "KAN"   # Hardcoded to Geminators project
+bq = bigquery.Client(project=PROJECT_ID)
+gcs = storage.Client(project=PROJECT_ID)
+bucket = gcs.bucket(BUCKET_NAME)
 
 # --------------------------
 # Request / Response Models
@@ -138,7 +122,7 @@ def requirement_generate(req: RequirementRequest):
             "source_repo": "github.com/myrepo",
             "created_at": datetime.utcnow().isoformat()
         }
-        table_ref = f"{bq.project}.qa_metrics.requirements"
+        table_ref = f"{PROJECT_ID}.qa_metrics.requirements"
         errors = bq.insert_rows_json(table_ref, [row])
         if errors:
             logger.error(f"BigQuery insert error: {errors}")
@@ -165,7 +149,7 @@ def testcase_generate(req: TestCaseRequest):
             "steps": ["Interpret requirement", "Validate system behavior matches requirement"],
             "expected_results": ["System satisfies requirement"]
         }
-        table_ref = f"{bq.project}.qa_metrics.test_cases"
+        table_ref = f"{PROJECT_ID}.qa_metrics.test_cases"
         errors = bq.insert_rows_json(table_ref, [row])
         if errors:
             logger.error(f"BigQuery insert error: {errors}")
@@ -193,8 +177,8 @@ def samples_generate(req: SamplesRequest):
             path = f"artifacts/samples/{req.req_id}/{tc}.json"
             blob = bucket.blob(path)
             blob.upload_from_string(json.dumps(obj, indent=2), content_type="application/json")
-            responses.append(SamplesResponse(test_case_id=tc, sample_path=f"gs://{bucket_name}/{path}"))
-            logger.info(f"Sample uploaded: gs://{bucket_name}/{path}")
+            responses.append(SamplesResponse(test_case_id=tc, sample_path=f"gs://{BUCKET_NAME}/{path}"))
+            logger.info(f"Sample uploaded: gs://{BUCKET_NAME}/{path}")
         return responses
     except Exception as e:
         logger.exception("Error in samples_generate")
@@ -233,10 +217,10 @@ public class {class_name} {{
             blob.upload_from_string(java_code, content_type="text/x-java-source")
             responses.append(JUnitResponse(
                 test_case_id=tc,
-                junit_path=f"gs://{bucket_name}/{path}",
-                sample_path=f"gs://{bucket_name}/artifacts/samples/{req.req_id}/{tc}.json"
+                junit_path=f"gs://{BUCKET_NAME}/{path}",
+                sample_path=f"gs://{BUCKET_NAME}/artifacts/samples/{req.req_id}/{tc}.json"
             ))
-            logger.info(f"JUnit uploaded: gs://{bucket_name}/{path}")
+            logger.info(f"JUnit uploaded: gs://{BUCKET_NAME}/{path}")
         return responses
     except Exception as e:
         logger.exception("Error in junit_generate")
@@ -269,7 +253,7 @@ def testresults_collect(req: TestResultsRequest):
                         elif testcase.find("skipped") is not None:
                             status, message = "SKIPPED", testcase.find("skipped").get("message") or "Skipped"
                         test_case_id = classname.split(".")[-1].replace("Test", "").replace("_", "-")
-                        sample_path = f"gs://{bucket_name}/artifacts/samples/{req.req_id}/{test_case_id}.json"
+                        sample_path = f"gs://{BUCKET_NAME}/artifacts/samples/{req.req_id}/{test_case_id}.json"
                         results.append({
                             "req_id": req.req_id,
                             "test_case_id": test_case_id,
@@ -285,7 +269,7 @@ def testresults_collect(req: TestResultsRequest):
         if not results:
             logger.warning("No results parsed from Surefire reports")
             return TestResultsResponse(inserted=0, results=[])
-        table_ref = f"{bq.project}.qa_metrics.test_results"
+        table_ref = f"{PROJECT_ID}.qa_metrics.test_results"
         errors = bq.insert_rows_json(table_ref, results)
         if errors:
             logger.error(f"BigQuery insert error: {errors}")
@@ -297,56 +281,54 @@ def testresults_collect(req: TestResultsRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # =================================
-# Jira Update (API v3 + KAN + ADF + Fixed)
+# Jira Update (patched)
 # =================================
 @app.post("/tools/jira.update", response_model=JiraResponse)
 def jira_update(req: JiraRequest):
     logger.info(f"Updating Jira for req_id={req.req_id}, run_id={req.run_id}")
     try:
+        ids = ",".join([f"'{tc}'" for tc in req.test_case_ids])
+
+        query = f"""
+            SELECT test_case_id, status, sample_path, recorded_at
+            FROM `{PROJECT_ID}.qa_metrics.test_results`
+            WHERE req_id='{req.req_id}'
+              AND test_case_id IN ({ids})
+            ORDER BY recorded_at DESC
+            LIMIT 20
+        """
+        rows = list(bq.query(query).result())
         run_id = req.run_id or f"run-{int(datetime.utcnow().timestamp())}"
 
-        # --- Search Jira using JQL ---
-        search_payload = {
-            "jql": f'project = {JIRA_PROJECT_KEY} AND summary ~ "{req.req_id}"'
-        }
-        logger.info(f"Jira search payload: {search_payload}")
+        run_lines = [f"### Test Run {run_id} ({datetime.utcnow().isoformat()} UTC)"]
+        if not rows:
+            run_lines.append("(No test results found in BigQuery)")
+        else:
+            for r in rows:
+                run_lines.append(
+                    f"- {r['test_case_id']}: {r['status']} "
+                    f"(Sample: {r['sample_path']}, Recorded: {r['recorded_at']})"
+                )
+        run_section = "\n".join(run_lines)
 
-        search_resp = requests.post(
-            f"{JIRA_URL}/rest/api/3/search/jql",
+        # --- Search Jira ---
+        search_resp = requests.get(
+            f"{JIRA_URL}/rest/api/2/search",
             auth=(JIRA_USER, JIRA_TOKEN),
-            headers={"Content-Type": "application/json"},
-            json=search_payload
+            params={"jql": f'project=KAN AND summary~"{req.req_id}"'}
         )
         if search_resp.status_code != 200:
-            error_text = search_resp.text
-            logger.error(f"Jira search failed: {search_resp.status_code}, {error_text}")
-            raise HTTPException(status_code=500, detail=f"Jira search failed: {error_text}")
+            logger.error(f"Jira search failed: {search_resp.status_code}, {search_resp.text}")
+            raise HTTPException(status_code=500, detail="Jira search failed")
 
         search_json = search_resp.json()
-        run_section = f"### Test Run {run_id} ({datetime.utcnow().isoformat()} UTC)\nAuto-update from MCP pipeline"
-
         if search_json.get("issues"):
             issue_key = search_json["issues"][0]["key"]
             logger.info(f"Found existing Jira issue {issue_key}, adding comment")
-            comment_payload = {
-                "body": {
-                    "type": "doc",
-                    "version": 1,
-                    "content": [
-                        {
-                            "type": "paragraph",
-                            "content": [
-                                {"type": "text", "text": run_section}
-                            ]
-                        }
-                    ]
-                }
-            }
             comment_resp = requests.post(
-                f"{JIRA_URL}/rest/api/3/issue/{issue_key}/comment",
+                f"{JIRA_URL}/rest/api/2/issue/{issue_key}/comment",
                 auth=(JIRA_USER, JIRA_TOKEN),
-                headers={"Content-Type": "application/json"},
-                json=comment_payload
+                json={"body": run_section}
             )
             if comment_resp.status_code >= 300:
                 logger.error(f"Failed to add Jira comment: {comment_resp.status_code}, {comment_resp.text}")
@@ -355,27 +337,38 @@ def jira_update(req: JiraRequest):
 
         # --- Create new Jira issue ---
         logger.info(f"No Jira issue found, creating new one for req_id={req.req_id}")
+        desc_lines = [f"*Requirement:* {req.req_id}\n"]
+        tc_query = f"""
+            SELECT test_case_id,title,description,steps,expected_results
+            FROM `{PROJECT_ID}.qa_metrics.test_cases`
+            WHERE req_id='{req.req_id}'
+              AND test_case_id IN ({ids})
+        """
+        tc_rows = list(bq.query(tc_query).result())
+        for tc in tc_rows:
+            desc_lines.append(f"*{tc['test_case_id']}: {tc['title']}*")
+            desc_lines.append(f"Description: {tc['description']}")
+            desc_lines.append("*Steps:*")
+            for s in tc["steps"]:
+                desc_lines.append(f"  - {s}")
+            desc_lines.append("*Expected:*")
+            for e in tc["expected_results"]:
+                desc_lines.append(f"  - {e}")
+            desc_lines.append("")
+        desc_lines.append("\n---\n")
+        desc_lines.append(run_section)
+
         issue_payload = {
             "fields": {
-                "project": {"key": JIRA_PROJECT_KEY},
+                "project": {"key": "KAN"},
                 "summary": f"{req.req_id} - Test Cases & Results",
-                "description": {
-                    "type": "doc",
-                    "version": 1,
-                    "content": [
-                        {
-                            "type": "paragraph",
-                            "content": [
-                                {"type": "text", "text": run_section}
-                            ]
-                        }
-                    ]
-                },
-                "issuetype": {"name": "Task"}   # Match working curl
+                "description": "\n".join(desc_lines),
+                "issuetype": {"name": "Task"}
             }
         }
+
         create_resp = requests.post(
-            f"{JIRA_URL}/rest/api/3/issue",
+            f"{JIRA_URL}/rest/api/2/issue",
             auth=(JIRA_USER, JIRA_TOKEN),
             headers={"Content-Type": "application/json"},
             json=issue_payload
@@ -391,25 +384,6 @@ def jira_update(req: JiraRequest):
 
     except Exception as e:
         logger.exception("Error in jira_update")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# =================================
-# Debug: Check Jira Config
-# =================================
-@app.get("/check-jira-config")
-def check_jira_config():
-    try:
-        result = {
-            "jira_user": JIRA_USER if JIRA_USER else "EMPTY",
-            "jira_url": JIRA_URL if JIRA_URL else "EMPTY",
-            "jira_project_key": JIRA_PROJECT_KEY,
-            "jira_token_length": len(JIRA_TOKEN) if JIRA_TOKEN else 0,
-        }
-        if not JIRA_USER or not JIRA_TOKEN or not JIRA_URL:
-            result["warning"] = "One or more Jira secrets are missing or not accessible!"
-        return result
-    except Exception as e:
-        logger.exception("Error reading Jira secrets")
         raise HTTPException(status_code=500, detail=str(e))
 
 # =================================

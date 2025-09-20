@@ -1,376 +1,127 @@
-import uuid
-import glob
-import json
-import requests
-import os
-import xml.etree.ElementTree as ET
-from datetime import datetime
-from typing import List
+import logging
+from fastapi import FastAPI, HTTPException
+from typing import Dict
 
-from fastapi import FastAPI
-from pydantic import BaseModel
-from google.cloud import bigquery, storage, secretmanager
-from langchain_google_vertexai import ChatVertexAI
-from langgraph.prebuilt import create_react_agent
-from langgraph.prebuilt.chat_agent_executor import AgentState
-from vertexai.generative_models import GenerativeModel
+from workflow import (
+    RequirementRequest,
+    RequirementResponse,
+    TestCaseRequest,
+    TestCaseResponse,
+    SamplesRequest,
+    SamplesResponse,
+    JUnitRequest,
+    JUnitResponse,
+    TestResultsRequest,
+    TestResultsResponse,
+    ISORequest,
+    ISOResult,
+    JiraRequest,
+    JiraResponse,
+    requirement_generate,
+    testcase_generate,
+    samples_generate,
+    junit_generate,
+    testresults_collect,
+    iso_validate,
+    jira_update,
+    interactive_pipeline,
+)
+from manager import manager_agent
 
-# ============================
-# App + Clients
-# ============================
+# -----------------------------
+# Logging
+# -----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("server")
 
-app = FastAPI(title="Insulin TCG MCP")
+# -----------------------------
+# FastAPI app
+# -----------------------------
+app = FastAPI(title="Insulin MCP Server", version="1.0")
 
-bq = bigquery.Client()
-storage_client = storage.Client()
-bucket_name = f"{bq.project}-tcg"
-bucket = storage_client.bucket(bucket_name)
+# -----------------------------
+# Health check
+# -----------------------------
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
 
-secret_client = secretmanager.SecretManagerServiceClient()
+# -----------------------------
+# Manager Agent Endpoint
+# -----------------------------
+@app.post("/manager")
+def manager(payload: Dict):
+    """
+    Manager agent:
+      - If general → Gemini answers directly
+      - If requirement → run pipeline (HITL: starts at requirement stage)
+    """
+    return manager_agent(payload)
 
-def access_secret(secret_name: str) -> str:
-    name = f"projects/{bq.project}/secrets/{secret_name}/versions/latest"
-    return secret_client.access_secret_version(
-        request={"name": name}
-    ).payload.data.decode("UTF-8")
+# -----------------------------
+# Pipeline: Start
+# -----------------------------
+@app.post("/pipeline/start")
+def pipeline_start(payload: dict):
+    """
+    Start the pipeline with a new requirement.
+    Returns requirement stage + req_id.
+    """
+    return interactive_pipeline(payload, stage="requirement")
 
-JIRA_USER = access_secret("jira-user")
-JIRA_TOKEN = access_secret("jira-token")
-JIRA_URL = access_secret("jira-url")
+# -----------------------------
+# Pipeline: Continue
+# -----------------------------
+@app.post("/pipeline/continue")
+def pipeline_continue(payload: dict):
+    """
+    Continue pipeline from current stage.
+    Expects:
+      - stage: str
+      - req_id: str
+      - test_case_ids: list[str] (only needed for samples/junit and jira stages)
+      - user_action: "continue" or "stop"
+    """
+    stage = payload.get("stage")
+    if not stage:
+        return {"status": "ERROR", "error": "Missing 'stage' in request"}
+    return interactive_pipeline(payload, stage=stage)
 
-# ============================
-# Pydantic Models
-# ============================
-
-class RequirementRequest(BaseModel):
-    prompt: str
-    source_repo: str | None = None
-
-class RequirementResponse(BaseModel):
-    req_id: str
-    requirement_text: str
-
-class TestCaseRequest(BaseModel):
-    req_id: str
-
-class TestCaseResponse(BaseModel):
-    test_case_id: str
-    title: str
-    description: str
-    steps: List[str]
-    expected_results: List[str]
-
-class SamplesRequest(BaseModel):
-    req_id: str
-    test_case_ids: List[str]
-
-class SamplesResult(BaseModel):
-    test_case_id: str
-    sample_path: str
-
-class JiraRequest(BaseModel):
-    req_id: str
-    test_case_ids: List[str]
-    run_id: str | None = None
-
-class JiraResponse(BaseModel):
-    issue_key: str
-    url: str
-
-# ============================
-# LangGraph Agent Setup
-# ============================
-
-tools = []
-llm = ChatVertexAI(model="gemini-2.5-pro", temperature=0)
-agent = create_react_agent(llm, tools, state_schema=AgentState)
-model = GenerativeModel("gemini-2.5-pro")
-
-# ============================
-# Tools
-# ============================
-
+# -----------------------------
+# Tools Endpoints
+# -----------------------------
 @app.post("/tools/requirement.generate", response_model=RequirementResponse)
-def requirement_generate(req: RequirementRequest):
-    req_id = f"REQ-{uuid.uuid4().hex[:8].upper()}"
-    requirement_text = req.prompt.strip()
-    table_ref = f"{bq.project}.qa_metrics.requirements"
-    rows = [{
-        "req_id": req_id,
-        "prompt": req.prompt,
-        "requirement_text": requirement_text,
-        "source_repo": req.source_repo or "",
-        "created_at": datetime.utcnow().isoformat(),
-    }]
-    errors = bq.insert_rows_json(table_ref, rows)
-    if errors:
-        raise Exception(f"BigQuery insert error: {errors}")
-    return RequirementResponse(req_id=req_id, requirement_text=requirement_text)
+def requirement_generate_tool(req: RequirementRequest):
+    return requirement_generate(req)
 
 @app.post("/tools/testcase.generate")
-def testcase_generate(req: TestCaseRequest) -> List[TestCaseResponse]:
-    query = f"SELECT requirement_text FROM `{bq.project}.qa_metrics.requirements` WHERE req_id = '{req.req_id}'"
-    rows = list(bq.query(query).result())
-    if not rows:
-        return []
-    requirement_text = rows[0]["requirement_text"]
+def testcase_generate_tool(req: TestCaseRequest) -> Dict:
+    tcs = testcase_generate(req)
+    return {"testcases": [t.model_dump() for t in tcs]}
 
-    prompt = f"""
-    Requirement ID: {req.req_id}
-    Requirement: {requirement_text}
-    Task: Generate 2–3 JSON test cases with fields: test_case_id, title, description, steps, expected_results.
-    """
-    response = model.generate_content(prompt)
-    answer_text = "".join([
-        part.text for c in response.candidates
-        for part in c.content.parts if hasattr(part, "text")
-    ])
-    try:
-        test_cases = json.loads(answer_text)
-    except Exception:
-        test_cases = [{
-            "test_case_id": f"TC-{uuid.uuid4().hex[:6].upper()}",
-            "title": f"Auto-generated test case for {req.req_id}",
-            "description": requirement_text,
-            "steps": [
-                f"Interpret requirement: {requirement_text}",
-                "Validate system behavior matches requirement"
-            ],
-            "expected_results": [
-                f"System satisfies: {requirement_text}"
-            ]
-        }]
-    for tc in test_cases:
-        tc["req_id"] = req.req_id
-    table_ref = f"{bq.project}.qa_metrics.test_cases"
-    bq.insert_rows_json(table_ref, test_cases)
-    return test_cases
+@app.post("/tools/iso.validate")
+def iso_validate_tool(req: ISORequest) -> Dict:
+    results = iso_validate(req)
+    return {"iso_validation": [r.model_dump() for r in results]}
 
 @app.post("/tools/samples.generate")
-def samples_generate(req: SamplesRequest) -> List[SamplesResult]:
-    results = []
-    for tc_id in req.test_case_ids:
-        sample_content = {
-            "test_case_id": tc_id,
-            "input": {"glucose": 180, "dose": 2},
-            "expected": {"delivery_logged": True}
-        }
-        blob_path = f"artifacts/samples/{req.req_id}/{tc_id}.json"
-        bucket.blob(blob_path).upload_from_string(
-            json.dumps(sample_content, indent=2),
-            content_type="application/json"
-        )
-        results.append({
-            "test_case_id": tc_id,
-            "sample_path": f"gs://{bucket_name}/{blob_path}"
-        })
-    return results
+def samples_generate_tool(req: SamplesRequest) -> Dict:
+    samples = samples_generate(req)
+    return {"samples": [s.model_dump() for s in samples]}
 
 @app.post("/tools/junit.generate")
-def junit_generate(req: JiraRequest):
-    results = []
-    ids = ",".join([f"'{tc}'" for tc in req.test_case_ids])
-    query = f"""
-        SELECT test_case_id,title,steps,expected_results
-        FROM `{bq.project}.qa_metrics.test_cases`
-        WHERE req_id='{req.req_id}' AND test_case_id IN ({ids})
-    """
-    rows = list(bq.query(query).result())
+def junit_generate_tool(req: JUnitRequest) -> Dict:
+    junits = junit_generate(req)
+    return {"junit": [j.model_dump() for j in junits]}
 
-    for row in rows:
-        tc_id, title = row["test_case_id"], row["title"]
-        steps = row.get("steps") or ["Step 1"]
-        expects = row.get("expected_results") or ["Expected outcome"]
-
-        safe_id = tc_id.replace("-", "_")
-        class_name = f"{safe_id}Test"
-        file_name = f"{class_name}.java"
-
-        steps_comment = "\n        ".join([f"// STEP: {s}" for s in steps])
-        expects_comment = "\n        ".join([f"// EXPECT: {e}" for e in expects])
-
-        junit_code = f"""package com.insulinpump.tests;
-
-import org.junit.jupiter.api.Test;
-import static org.junit.jupiter.api.Assertions.*;
-import java.nio.file.*;
-import org.json.JSONObject;
-
-public class {class_name} {{
-
-    @Test
-    public void testCase() throws Exception {{
-        // Requirement: {title}
-        {steps_comment}
-        {expects_comment}
-
-        // Load sample JSON
-        String json = new String(Files.readAllBytes(Paths.get("src/test/resources/samples/{tc_id}.json")));
-        JSONObject sample = new JSONObject(json);
-
-        int glucose = sample.getJSONObject("input").getInt("glucose");
-        int dose = sample.getJSONObject("input").getInt("dose");
-
-        assertTrue(glucose > 0);
-        assertTrue(dose >= 0);
-    }}
-}}
-"""
-        blob_path = f"artifacts/junit/{req.req_id}/{file_name}"
-        bucket.blob(blob_path).upload_from_string(
-            junit_code,
-            content_type="text/x-java-source"
-        )
-        results.append({
-            "test_case_id": tc_id,
-            "junit_path": f"gs://{bucket_name}/{blob_path}"
-        })
-
-    return results
-
-@app.post("/tools/testresults.collect")
-def testresults_collect(req: TestCaseRequest):
-    results = []
-    candidate_dirs = [
-        "target/surefire-reports",
-        "insulin-repo/Personal_Insulin_Pump-Integrated_System/target/surefire-reports",
-    ]
-    report_dirs = [d for d in candidate_dirs if os.path.exists(d)]
-    if not report_dirs:
-        return {"error": "No Surefire reports found."}
-
-    for report_dir in report_dirs:
-        for xml_file in glob.glob(os.path.join(report_dir, "*.xml")):
-            try:
-                tree = ET.parse(xml_file)
-                root = tree.getroot()
-                for testcase in root.findall(".//testcase"):
-                    classname = testcase.get("classname")
-                    status, message = "PASS", "Test passed"
-                    if testcase.find("failure") is not None:
-                        status, message = "FAIL", testcase.find("failure").get("message") or "Failure"
-                    elif testcase.find("error") is not None:
-                        status, message = "ERROR", testcase.find("error").get("message") or "Error"
-                    elif testcase.find("skipped") is not None:
-                        status, message = "SKIPPED", testcase.find("skipped").get("message") or "Skipped"
-
-                    test_case_id = classname.split(".")[-1].replace("Test", "").replace("_", "-")
-                    sample_path = f"gs://{bucket_name}/artifacts/samples/{req.req_id}/{test_case_id}.json"
-                    results.append({
-                        "req_id": req.req_id,
-                        "test_case_id": test_case_id,
-                        "status": status,
-                        "message": message,
-                        "sample_path": sample_path,
-                        "recorded_at": datetime.utcnow().isoformat()
-                    })
-            except Exception:
-                continue
-
-    if not results:
-        return {"error": "No results parsed from Surefire reports."}
-
-    table_ref = f"{bq.project}.qa_metrics.test_results"
-    errors = bq.insert_rows_json(table_ref, results)
-    if errors:
-        return {"error": f"BigQuery insert error: {errors}"}
-    return {"inserted": len(results), "results": results}
-
-# ============================
-# Jira Update (simplified)
-# ============================
+@app.post("/tools/testresults.collect", response_model=TestResultsResponse)
+def testresults_collect_tool(req: TestResultsRequest):
+    return testresults_collect(req)
 
 @app.post("/tools/jira.update", response_model=JiraResponse)
-def jira_update(req: JiraRequest):
-    ids = ",".join([f"'{tc}'" for tc in req.test_case_ids])
-    query = f"""
-        SELECT test_case_id, status, sample_path, recorded_at
-        FROM `{bq.project}.qa_metrics.test_results`
-        WHERE req_id='{req.req_id}'
-          AND test_case_id IN ({ids})
-        ORDER BY recorded_at DESC
-        LIMIT 20
-    """
-    rows = list(bq.query(query).result())
-
-    run_id = req.run_id or f"run-{int(datetime.utcnow().timestamp())}"
-    run_lines = [f"### Test Run {run_id} ({datetime.utcnow().isoformat()} UTC)"]
-
-    if not rows:
-        run_lines.append("(No test results found in BigQuery)")
-    else:
-        for r in rows:
-            run_lines.append(
-                f"- {r['test_case_id']}: {r['status']} "
-                f"(Sample: {r['sample_path']}, Recorded: {r['recorded_at']})"
-            )
-
-    run_section = "\n".join(run_lines)
-
-    search_resp = requests.get(
-        f"{JIRA_URL}/rest/api/2/search",
-        auth=(JIRA_USER, JIRA_TOKEN),
-        params={"jql": f'project=KAN AND summary~"{req.req_id}"'}
-    ).json()
-
-    if search_resp.get("issues"):
-        issue_key = search_resp["issues"][0]["key"]
-        requests.post(
-            f"{JIRA_URL}/rest/api/2/issue/{issue_key}/comment",
-            auth=(JIRA_USER, JIRA_TOKEN),
-            json={"body": run_section}
-        )
-        return JiraResponse(issue_key=issue_key, url=f"{JIRA_URL}/browse/{issue_key}")
-
-    desc_lines = [f"*Requirement:* {req.req_id}\n"]
-    tc_query = f"""
-        SELECT test_case_id,title,description,steps,expected_results
-        FROM `{bq.project}.qa_metrics.test_cases`
-        WHERE req_id='{req.req_id}'
-          AND test_case_id IN ({ids})
-    """
-    tc_rows = list(bq.query(tc_query).result())
-    for tc in tc_rows:
-        desc_lines.append(f"*{tc['test_case_id']}: {tc['title']}*")
-        desc_lines.append(f"Description: {tc['description']}")
-        desc_lines.append("*Steps:*")
-        for s in tc["steps"]:
-            desc_lines.append(f"  - {s}")
-        desc_lines.append("*Expected:*")
-        for e in tc["expected_results"]:
-            desc_lines.append(f"  - {e}")
-        desc_lines.append("")
-
-    desc_lines.append("\n---\n")
-    desc_lines.append(run_section)
-
-    issue_data = {
-        "fields": {
-            "project": {"key": "KAN"},
-            "summary": f"Requirement {req.req_id} - Automated Tests",
-            "description": "\n".join(desc_lines),
-            "issuetype": {"name": "Task"},
-        }
-    }
-
-    resp = requests.post(
-        f"{JIRA_URL}/rest/api/2/issue",
-        auth=(JIRA_USER, JIRA_TOKEN),
-        json=issue_data,
-    ).json()
-
-    return JiraResponse(issue_key=resp["key"], url=f"{JIRA_URL}/browse/{resp['key']}")
-
-# ============================
-# Root
-# ============================
-
-@app.get("/")
-def root():
-    return {"message": "MCP server is running"}
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=port)
+def jira_update_tool(req: JiraRequest):
+    return jira_update(req)
 

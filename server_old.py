@@ -297,7 +297,7 @@ def testresults_collect(req: TestResultsRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # =================================
-# Jira Update (API v3 + KAN + ADF + Fixed)
+# Jira Update (API v3 + KAN + ADF + FIXED search)
 # =================================
 @app.post("/tools/jira.update", response_model=JiraResponse)
 def jira_update(req: JiraRequest):
@@ -305,7 +305,7 @@ def jira_update(req: JiraRequest):
     try:
         run_id = req.run_id or f"run-{int(datetime.utcnow().timestamp())}"
 
-        # --- Search Jira using JQL ---
+        # --- Search Jira using new endpoint ---
         search_payload = {
             "jql": f'project = {JIRA_PROJECT_KEY} AND summary ~ "{req.req_id}"'
         }
@@ -371,7 +371,7 @@ def jira_update(req: JiraRequest):
                         }
                     ]
                 },
-                "issuetype": {"name": "Task"}   # Match working curl
+                "issuetype": {"name": "Task"}
             }
         }
         create_resp = requests.post(

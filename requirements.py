@@ -1,14 +1,9 @@
 fastapi
 uvicorn
-openai>=1.0.0
 google-cloud-aiplatform>=1.49
 google-cloud-bigquery
 google-cloud-storage
 google-cloud-secret-manager
-langchain
-langchain-google-vertexai
-langgraph
-vertexai
-requests
 pydantic
+requests
 
