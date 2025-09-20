@@ -128,6 +128,7 @@ def testcase_generate(req: TestCaseRequest) -> List[TestCaseResponse]:
     try:
         test_cases = json.loads(answer_text)
     except Exception:
+        # Smarter fallback
         test_cases = [{
             "test_case_id": f"TC-{uuid.uuid4().hex[:6].upper()}",
             "title": f"Auto-generated test case for {req.req_id}",
@@ -182,6 +183,7 @@ def junit_generate(req: JiraRequest):
         steps = row.get("steps") or ["Step 1"]
         expects = row.get("expected_results") or ["Expected outcome"]
 
+        # ✅ sanitize class/file name
         safe_id = tc_id.replace("-", "_")
         class_name = f"{safe_id}Test"
         file_name = f"{class_name}.java"
@@ -211,11 +213,13 @@ public class {class_name} {{
         int glucose = sample.getJSONObject("input").getInt("glucose");
         int dose = sample.getJSONObject("input").getInt("dose");
 
+        // TODO: Replace with real AppController call
         assertTrue(glucose > 0);
         assertTrue(dose >= 0);
     }}
 }}
 """
+        # ✅ overwrite old files
         blob_path = f"artifacts/junit/{req.req_id}/{file_name}"
         bucket.blob(blob_path).upload_from_string(
             junit_code,
@@ -237,7 +241,7 @@ def testresults_collect(req: TestCaseRequest):
     ]
     report_dirs = [d for d in candidate_dirs if os.path.exists(d)]
     if not report_dirs:
-        return {"error": "No Surefire reports found."}
+        return {"error": "No Surefire reports found in any candidate directory."}
 
     for report_dir in report_dirs:
         for xml_file in glob.glob(os.path.join(report_dir, "*.xml")):
@@ -277,36 +281,51 @@ def testresults_collect(req: TestCaseRequest):
     return {"inserted": len(results), "results": results}
 
 # ============================
-# Jira Update (simplified)
+# Jira Update with inline samples
 # ============================
+
+def load_sample_json(path: str) -> str:
+    if not path or not path.startswith("gs://"):
+        return ""
+    try:
+        parts = path.replace("gs://", "").split("/", 1)
+        bucket_name, blob_path = parts[0], parts[1]
+        blob = storage.Client().bucket(bucket_name).blob(blob_path)
+        content = blob.download_as_text()
+        if len(content) > 800:
+            return content[:800] + "... (truncated)"
+        return content
+    except Exception as e:
+        return f"(Failed to load sample: {e})"
 
 @app.post("/tools/jira.update", response_model=JiraResponse)
 def jira_update(req: JiraRequest):
-    ids = ",".join([f"'{tc}'" for tc in req.test_case_ids])
     query = f"""
-        SELECT test_case_id, status, sample_path, recorded_at
-        FROM `{bq.project}.qa_metrics.test_results`
-        WHERE req_id='{req.req_id}'
-          AND test_case_id IN ({ids})
-        ORDER BY recorded_at DESC
-        LIMIT 20
+        SELECT AS STRUCT test_case_id, status, sample_path, recorded_at
+        FROM (
+            SELECT test_case_id, status, sample_path, recorded_at,
+                   ROW_NUMBER() OVER(PARTITION BY test_case_id ORDER BY recorded_at DESC) as rn
+            FROM `{bq.project}.qa_metrics.test_results`
+            WHERE req_id='{req.req_id}'
+              AND test_case_id IN UNNEST({req.test_case_ids})
+        )
+        WHERE rn = 1
     """
     rows = list(bq.query(query).result())
 
     run_id = req.run_id or f"run-{int(datetime.utcnow().timestamp())}"
     run_lines = [f"### Test Run {run_id} ({datetime.utcnow().isoformat()} UTC)"]
-
-    if not rows:
-        run_lines.append("(No test results found in BigQuery)")
-    else:
-        for r in rows:
+    for r in rows:
+        sample_json = load_sample_json(r['sample_path'])
+        if sample_json:
             run_lines.append(
-                f"- {r['test_case_id']}: {r['status']} "
-                f"(Sample: {r['sample_path']}, Recorded: {r['recorded_at']})"
+                f"- *{r['test_case_id']}*: {r['status']}\n  *Sample Used:*\n  {sample_json}"
             )
-
+        else:
+            run_lines.append(f"- *{r['test_case_id']}*: {r['status']} (No sample found)")
     run_section = "\n".join(run_lines)
 
+    # Check Jira issue
     search_resp = requests.get(
         f"{JIRA_URL}/rest/api/2/search",
         auth=(JIRA_USER, JIRA_TOKEN),
@@ -322,14 +341,16 @@ def jira_update(req: JiraRequest):
         )
         return JiraResponse(issue_key=issue_key, url=f"{JIRA_URL}/browse/{issue_key}")
 
-    desc_lines = [f"*Requirement:* {req.req_id}\n"]
+    # Create new issue with test cases + run
     tc_query = f"""
         SELECT test_case_id,title,description,steps,expected_results
         FROM `{bq.project}.qa_metrics.test_cases`
         WHERE req_id='{req.req_id}'
-          AND test_case_id IN ({ids})
+          AND test_case_id IN UNNEST({req.test_case_ids})
     """
     tc_rows = list(bq.query(tc_query).result())
+
+    desc_lines = [f"*Requirement:* {req.req_id}\n"]
     for tc in tc_rows:
         desc_lines.append(f"*{tc['test_case_id']}: {tc['title']}*")
         desc_lines.append(f"Description: {tc['description']}")

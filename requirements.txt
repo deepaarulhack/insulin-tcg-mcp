@@ -1,5 +1,5 @@
 fastapi
-uvicorn[standard]
+uvicorn
 google-cloud-bigquery
 google-cloud-storage
 google-cloud-secret-manager

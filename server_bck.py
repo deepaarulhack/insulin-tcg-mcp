@@ -7,7 +7,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import List
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Body
 from pydantic import BaseModel
 from google.cloud import bigquery, storage, secretmanager
 from langchain_google_vertexai import ChatVertexAI
@@ -59,6 +59,16 @@ class TestCaseResponse(BaseModel):
     description: str
     steps: List[str]
     expected_results: List[str]
+
+class ISORequest(BaseModel):
+    test_case_ids: List[str]
+
+class ISOResult(BaseModel):
+    test_case_id: str
+    compliant: bool
+    missing_elements: List[str]
+    related_iso_refs: List[str]
+    suggestions: str
 
 class SamplesRequest(BaseModel):
     req_id: str
@@ -121,24 +131,16 @@ def testcase_generate(req: TestCaseRequest) -> List[TestCaseResponse]:
     Task: Generate 2–3 JSON test cases with fields: test_case_id, title, description, steps, expected_results.
     """
     response = model.generate_content(prompt)
-    answer_text = "".join([
-        part.text for c in response.candidates
-        for part in c.content.parts if hasattr(part, "text")
-    ])
+    answer_text = "".join([part.text for c in response.candidates for part in c.content.parts if hasattr(part, "text")])
     try:
         test_cases = json.loads(answer_text)
     except Exception:
         test_cases = [{
             "test_case_id": f"TC-{uuid.uuid4().hex[:6].upper()}",
-            "title": f"Auto-generated test case for {req.req_id}",
+            "title": "Fallback test case",
             "description": requirement_text,
-            "steps": [
-                f"Interpret requirement: {requirement_text}",
-                "Validate system behavior matches requirement"
-            ],
-            "expected_results": [
-                f"System satisfies: {requirement_text}"
-            ]
+            "steps": ["Step 1", "Step 2"],
+            "expected_results": ["Expected outcome"],
         }]
     for tc in test_cases:
         tc["req_id"] = req.req_id
@@ -176,14 +178,11 @@ def junit_generate(req: JiraRequest):
         WHERE req_id='{req.req_id}' AND test_case_id IN ({ids})
     """
     rows = list(bq.query(query).result())
-
     for row in rows:
         tc_id, title = row["test_case_id"], row["title"]
-        steps = row.get("steps") or ["Step 1"]
-        expects = row.get("expected_results") or ["Expected outcome"]
+        steps, expects = row.get("steps", []), row.get("expected_results", [])
 
-        safe_id = tc_id.replace("-", "_")
-        class_name = f"{safe_id}Test"
+        class_name = f"{tc_id}Test"
         file_name = f"{class_name}.java"
 
         steps_comment = "\n        ".join([f"// STEP: {s}" for s in steps])
@@ -211,21 +210,15 @@ public class {class_name} {{
         int glucose = sample.getJSONObject("input").getInt("glucose");
         int dose = sample.getJSONObject("input").getInt("dose");
 
+        // TODO: Replace with real AppController call
         assertTrue(glucose > 0);
-        assertTrue(dose >= 0);
+        assertTrue(dose > 0);
     }}
 }}
 """
         blob_path = f"artifacts/junit/{req.req_id}/{file_name}"
-        bucket.blob(blob_path).upload_from_string(
-            junit_code,
-            content_type="text/x-java-source"
-        )
-        results.append({
-            "test_case_id": tc_id,
-            "junit_path": f"gs://{bucket_name}/{blob_path}"
-        })
-
+        bucket.blob(blob_path).upload_from_string(junit_code, content_type="text/x-java-source")
+        results.append({"test_case_id": tc_id, "junit_path": f"gs://{bucket_name}/{blob_path}"})
     return results
 
 @app.post("/tools/testresults.collect")
@@ -235,9 +228,10 @@ def testresults_collect(req: TestCaseRequest):
         "target/surefire-reports",
         "insulin-repo/Personal_Insulin_Pump-Integrated_System/target/surefire-reports",
     ]
+
     report_dirs = [d for d in candidate_dirs if os.path.exists(d)]
     if not report_dirs:
-        return {"error": "No Surefire reports found."}
+        return {"error": "No Surefire reports found in any candidate directory."}
 
     for report_dir in report_dirs:
         for xml_file in glob.glob(os.path.join(report_dir, "*.xml")):
@@ -254,7 +248,7 @@ def testresults_collect(req: TestCaseRequest):
                     elif testcase.find("skipped") is not None:
                         status, message = "SKIPPED", testcase.find("skipped").get("message") or "Skipped"
 
-                    test_case_id = classname.split(".")[-1].replace("Test", "").replace("_", "-")
+                    test_case_id = classname.split(".")[-1].replace("Test", "")
                     sample_path = f"gs://{bucket_name}/artifacts/samples/{req.req_id}/{test_case_id}.json"
                     results.append({
                         "req_id": req.req_id,
@@ -276,37 +270,29 @@ def testresults_collect(req: TestCaseRequest):
         return {"error": f"BigQuery insert error: {errors}"}
     return {"inserted": len(results), "results": results}
 
-# ============================
-# Jira Update (simplified)
-# ============================
-
 @app.post("/tools/jira.update", response_model=JiraResponse)
 def jira_update(req: JiraRequest):
-    ids = ",".join([f"'{tc}'" for tc in req.test_case_ids])
+    # Step 1: Fetch latest results per test_case_id
     query = f"""
-        SELECT test_case_id, status, sample_path, recorded_at
-        FROM `{bq.project}.qa_metrics.test_results`
-        WHERE req_id='{req.req_id}'
-          AND test_case_id IN ({ids})
-        ORDER BY recorded_at DESC
-        LIMIT 20
+        SELECT AS STRUCT test_case_id, status, sample_path, recorded_at
+        FROM (
+            SELECT test_case_id, status, sample_path, recorded_at,
+                   ROW_NUMBER() OVER(PARTITION BY test_case_id ORDER BY recorded_at DESC) as rn
+            FROM `{bq.project}.qa_metrics.test_results`
+            WHERE req_id='{req.req_id}'
+              AND test_case_id IN UNNEST({req.test_case_ids})
+        )
+        WHERE rn = 1
     """
     rows = list(bq.query(query).result())
 
     run_id = req.run_id or f"run-{int(datetime.utcnow().timestamp())}"
     run_lines = [f"### Test Run {run_id} ({datetime.utcnow().isoformat()} UTC)"]
-
-    if not rows:
-        run_lines.append("(No test results found in BigQuery)")
-    else:
-        for r in rows:
-            run_lines.append(
-                f"- {r['test_case_id']}: {r['status']} "
-                f"(Sample: {r['sample_path']}, Recorded: {r['recorded_at']})"
-            )
-
+    for r in rows:
+        run_lines.append(f"- {r['test_case_id']}: {r['status']} ({r['sample_path']})")
     run_section = "\n".join(run_lines)
 
+    # Step 2: Check if Jira issue already exists for this requirement
     search_resp = requests.get(
         f"{JIRA_URL}/rest/api/2/search",
         auth=(JIRA_USER, JIRA_TOKEN),
@@ -315,6 +301,7 @@ def jira_update(req: JiraRequest):
 
     if search_resp.get("issues"):
         issue_key = search_resp["issues"][0]["key"]
+        # Append test run as a comment
         requests.post(
             f"{JIRA_URL}/rest/api/2/issue/{issue_key}/comment",
             auth=(JIRA_USER, JIRA_TOKEN),
@@ -322,21 +309,23 @@ def jira_update(req: JiraRequest):
         )
         return JiraResponse(issue_key=issue_key, url=f"{JIRA_URL}/browse/{issue_key}")
 
-    desc_lines = [f"*Requirement:* {req.req_id}\n"]
+    # Step 3: If not found, create a new issue with requirement + test cases
     tc_query = f"""
         SELECT test_case_id,title,description,steps,expected_results
         FROM `{bq.project}.qa_metrics.test_cases`
         WHERE req_id='{req.req_id}'
-          AND test_case_id IN ({ids})
+          AND test_case_id IN UNNEST({req.test_case_ids})
     """
     tc_rows = list(bq.query(tc_query).result())
+
+    desc_lines = [f"*Requirement:* {req.req_id}\n"]
     for tc in tc_rows:
         desc_lines.append(f"*{tc['test_case_id']}: {tc['title']}*")
         desc_lines.append(f"Description: {tc['description']}")
-        desc_lines.append("*Steps:*")
+        desc_lines.append("Steps:")
         for s in tc["steps"]:
             desc_lines.append(f"  - {s}")
-        desc_lines.append("*Expected:*")
+        desc_lines.append("Expected:")
         for e in tc["expected_results"]:
             desc_lines.append(f"  - {e}")
         desc_lines.append("")
