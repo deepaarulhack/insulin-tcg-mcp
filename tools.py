@@ -60,7 +60,7 @@ def access_secret(secret_name: str) -> str:
 # Jira Config
 # --------------------------
 JIRA_USER = "deepaarulhack@gmail.com"
-JIRA_TOKEN = "ATATT3xFfGF0EWC_qKh_uv1d5A4bLfaPWLmAUq3bQ3c8VligpVmgnqUmg2JkPLkINr96bCB2tvo5v_2nW7kBYfq4V_OLm74-5UhvkhPP_R20qD6WMRrvgdpNhnfH61SINqQkpk-kA1GZlOyj9sVla4F834UwFN2-xMYjkFEGHe-AwVxBn92gpcI=EBC8E9F0"
+JIRA_TOKEN = ""
 JIRA_URL = "https://deepaarulhack.atlassian.net"
 JIRA_PROJECT_KEY = "KAN"
 HTTP_TIMEOUT = 20  # seconds
