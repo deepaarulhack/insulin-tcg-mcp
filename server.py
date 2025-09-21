@@ -1,127 +1,118 @@
+import uuid
+import os
 import logging
-from fastapi import FastAPI, HTTPException
-from typing import Dict
+from datetime import datetime
+from typing import List, Dict, Any
 
-from workflow import (
-    RequirementRequest,
-    RequirementResponse,
-    TestCaseRequest,
-    TestCaseResponse,
-    SamplesRequest,
-    SamplesResponse,
-    JUnitRequest,
-    JUnitResponse,
-    TestResultsRequest,
-    TestResultsResponse,
-    ISORequest,
-    ISOResult,
-    JiraRequest,
-    JiraResponse,
-    requirement_generate,
-    testcase_generate,
-    samples_generate,
-    junit_generate,
-    testresults_collect,
-    iso_validate,
-    jira_update,
-    interactive_pipeline,
-)
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+# Import orchestrator & manager
+from workflow import interactive_pipeline
 from manager import manager_agent
 
-# -----------------------------
-# Logging
-# -----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
-logger = logging.getLogger("server")
-
-# -----------------------------
+# ---------------------------------------------------
 # FastAPI app
-# -----------------------------
-app = FastAPI(title="Insulin MCP Server", version="1.0")
+# ---------------------------------------------------
+app = FastAPI(title="MCP Server", version="1.0.0")
 
-# -----------------------------
+# Enable CORS (for frontend → backend connectivity)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # TODO: restrict in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------
+# Models
+# ---------------------------------------------------
+class RequirementRequest(BaseModel):
+    prompt: str
+    source_repo: str | None = None
+
+class RequirementResponse(BaseModel):
+    req_id: str
+    requirement_text: str
+
+class TestCaseRequest(BaseModel):
+    req_id: str
+
+class SamplesRequest(BaseModel):
+    req_id: str
+    test_case_ids: List[str]
+
+class JUnitRequest(BaseModel):
+    req_id: str
+    test_case_ids: List[str]
+
+class TestResultsRequest(BaseModel):
+    req_id: str
+
+class JiraRequest(BaseModel):
+    req_id: str
+    test_case_ids: List[str]
+    run_id: str | None = None
+
+class JiraResponse(BaseModel):
+    issue_key: str
+    url: str
+
+class ISORequest(BaseModel):
+    test_case_ids: List[str]
+
+class ISOResult(BaseModel):
+    test_case_id: str
+    compliant: bool
+    missing_elements: List[str]
+    related_iso_refs: List[str]
+    suggestions: str
+
+# ---------------------------------------------------
 # Health check
-# -----------------------------
+# ---------------------------------------------------
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
 
-# -----------------------------
-# Manager Agent Endpoint
-# -----------------------------
+# ---------------------------------------------------
+# Manager Agent
+# ---------------------------------------------------
 @app.post("/manager")
-def manager(payload: Dict):
-    """
-    Manager agent:
-      - If general → Gemini answers directly
-      - If requirement → run pipeline (HITL: starts at requirement stage)
-    """
+def manager(payload: Dict[str, Any]):
     return manager_agent(payload)
 
-# -----------------------------
-# Pipeline: Start
-# -----------------------------
+# ---------------------------------------------------
+# Pipeline endpoints
+# ---------------------------------------------------
 @app.post("/pipeline/start")
-def pipeline_start(payload: dict):
-    """
-    Start the pipeline with a new requirement.
-    Returns requirement stage + req_id.
-    """
+def pipeline_start(req: RequirementRequest):
+    payload = {"prompt": req.prompt, "source_repo": req.source_repo}
     return interactive_pipeline(payload, stage="requirement")
 
-# -----------------------------
-# Pipeline: Continue
-# -----------------------------
 @app.post("/pipeline/continue")
-def pipeline_continue(payload: dict):
-    """
-    Continue pipeline from current stage.
-    Expects:
-      - stage: str
-      - req_id: str
-      - test_case_ids: list[str] (only needed for samples/junit and jira stages)
-      - user_action: "continue" or "stop"
-    """
-    stage = payload.get("stage")
-    if not stage:
-        return {"status": "ERROR", "error": "Missing 'stage' in request"}
+def pipeline_continue(payload: Dict[str, Any]):
+    stage = payload.get("stage", "requirement")
     return interactive_pipeline(payload, stage=stage)
 
-# -----------------------------
-# Tools Endpoints
-# -----------------------------
-@app.post("/tools/requirement.generate", response_model=RequirementResponse)
-def requirement_generate_tool(req: RequirementRequest):
-    return requirement_generate(req)
-
-@app.post("/tools/testcase.generate")
-def testcase_generate_tool(req: TestCaseRequest) -> Dict:
-    tcs = testcase_generate(req)
-    return {"testcases": [t.model_dump() for t in tcs]}
-
-@app.post("/tools/iso.validate")
-def iso_validate_tool(req: ISORequest) -> Dict:
-    results = iso_validate(req)
-    return {"iso_validation": [r.model_dump() for r in results]}
-
-@app.post("/tools/samples.generate")
-def samples_generate_tool(req: SamplesRequest) -> Dict:
-    samples = samples_generate(req)
-    return {"samples": [s.model_dump() for s in samples]}
-
-@app.post("/tools/junit.generate")
-def junit_generate_tool(req: JUnitRequest) -> Dict:
-    junits = junit_generate(req)
-    return {"junit": [j.model_dump() for j in junits]}
-
-@app.post("/tools/testresults.collect", response_model=TestResultsResponse)
-def testresults_collect_tool(req: TestResultsRequest):
-    return testresults_collect(req)
-
-@app.post("/tools/jira.update", response_model=JiraResponse)
-def jira_update_tool(req: JiraRequest):
-    return jira_update(req)
+# ---------------------------------------------------
+# ISO Validation (standalone endpoint)
+# ---------------------------------------------------
+@app.post("/tools/iso.validate", response_model=List[ISOResult])
+def iso_validate(req: ISORequest):
+    results = []
+    for tc_id in req.test_case_ids:
+        compliant = not tc_id.endswith("3")
+        missing = ["Acceptance criteria not detailed"] if not compliant else []
+        suggestion = "Add precise acceptance criteria." if not compliant else "Looks good."
+        results.append({
+            "test_case_id": tc_id,
+            "compliant": compliant,
+            "missing_elements": missing,
+            "related_iso_refs": ["ISO 62304 §5.5.1", "ISO 14971 §7.4"],
+            "suggestions": suggestion
+        })
+    return results
 

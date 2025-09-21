@@ -3,15 +3,20 @@ from fastapi import FastAPI, HTTPException
 from typing import Dict
 
 from workflow import (
-    # Models
-    RequirementRequest, RequirementResponse,
-    TestCaseRequest, TestCaseResponse,
-    SamplesRequest, SamplesResponse,
-    JUnitRequest, JUnitResponse,
-    TestResultsRequest, TestResultsResponse,
-    ISORequest, ISOResult,
-    JiraRequest, JiraResponse,
-    # Functions
+    RequirementRequest,
+    RequirementResponse,
+    TestCaseRequest,
+    TestCaseResponse,
+    SamplesRequest,
+    SamplesResponse,
+    JUnitRequest,
+    JUnitResponse,
+    TestResultsRequest,
+    TestResultsResponse,
+    ISORequest,
+    ISOResult,
+    JiraRequest,
+    JiraResponse,
     requirement_generate,
     testcase_generate,
     samples_generate,
@@ -21,6 +26,7 @@ from workflow import (
     jira_update,
     interactive_pipeline,
 )
+from manager import manager_agent
 
 # -----------------------------
 # Logging
@@ -34,83 +40,97 @@ logger = logging.getLogger("server")
 # -----------------------------
 # FastAPI app
 # -----------------------------
-app = FastAPI(title="Insulin MCP Pipeline")
+from fastapi.middleware.cors import CORSMiddleware
+app = FastAPI(title="Insulin MCP Server", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # -----------------------------
-# Health & Debug
+# Health check
 # -----------------------------
 @app.get("/healthz")
-def health():
+def healthz():
     return {"status": "ok"}
 
-@app.get("/check-gemini")
-def check_gemini():
-    # quick probe
-    try:
-        resp = {"gemini": "configured"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    return resp
+# -----------------------------
+# Manager Agent Endpoint
+# -----------------------------
+@app.post("/manager")
+def manager(payload: Dict):
+    """
+    Manager agent:
+      - If general → Gemini answers directly
+      - If requirement → run pipeline (HITL: starts at requirement stage)
+    """
+    return manager_agent(payload)
+
+# -----------------------------
+# Pipeline: Start
+# -----------------------------
+@app.post("/pipeline/start")
+def pipeline_start(payload: dict):
+    """
+    Start the pipeline with a new requirement.
+    Returns requirement stage + req_id.
+    """
+    return interactive_pipeline(payload, stage="requirement")
+
+# -----------------------------
+# Pipeline: Continue
+# -----------------------------
+@app.post("/pipeline/continue")
+def pipeline_continue(payload: dict):
+    """
+    Continue pipeline from current stage.
+    Expects:
+      - stage: str
+      - req_id: str
+      - test_case_ids: list[str] (only needed for samples/junit and jira stages)
+      - user_action: "continue" or "stop"
+    """
+    stage = payload.get("stage")
+    if not stage:
+        return {"status": "ERROR", "error": "Missing 'stage' in request"}
+    return interactive_pipeline(payload, stage=stage)
 
 # -----------------------------
 # Tools Endpoints
 # -----------------------------
 @app.post("/tools/requirement.generate", response_model=RequirementResponse)
-def tool_requirement(req: RequirementRequest):
+def requirement_generate_tool(req: RequirementRequest):
     return requirement_generate(req)
 
-@app.post("/tools/testcase.generate", response_model=list[TestCaseResponse])
-def tool_testcase(req: TestCaseRequest):
-    return testcase_generate(req)
+@app.post("/tools/testcase.generate")
+def testcase_generate_tool(req: TestCaseRequest) -> Dict:
+    tcs = testcase_generate(req)
+    return {"testcases": [t.model_dump() for t in tcs]}
 
-@app.post("/tools/iso.validate", response_model=list[ISOResult])
-def tool_iso(req: ISORequest):
-    return iso_validate(req)
+@app.post("/tools/iso.validate")
+def iso_validate_tool(req: ISORequest) -> Dict:
+    results = iso_validate(req)
+    return {"iso_validation": [r.model_dump() for r in results]}
 
-@app.post("/tools/samples.generate", response_model=list[SamplesResponse])
-def tool_samples(req: SamplesRequest):
-    return samples_generate(req)
+@app.post("/tools/samples.generate")
+def samples_generate_tool(req: SamplesRequest) -> Dict:
+    samples = samples_generate(req)
+    return {"samples": [s.model_dump() for s in samples]}
 
-@app.post("/tools/junit.generate", response_model=list[JUnitResponse])
-def tool_junit(req: JUnitRequest):
-    return junit_generate(req)
+@app.post("/tools/junit.generate")
+def junit_generate_tool(req: JUnitRequest) -> Dict:
+    junits = junit_generate(req)
+    return {"junit": [j.model_dump() for j in junits]}
 
 @app.post("/tools/testresults.collect", response_model=TestResultsResponse)
-def tool_testresults(req: TestResultsRequest):
+def testresults_collect_tool(req: TestResultsRequest):
     return testresults_collect(req)
 
 @app.post("/tools/jira.update", response_model=JiraResponse)
-def tool_jira(req: JiraRequest):
+def jira_update_tool(req: JiraRequest):
     return jira_update(req)
-
-# -----------------------------
-# Interactive Pipeline
-# -----------------------------
-@app.post("/pipeline/start")
-def pipeline_start(payload: Dict):
-    try:
-        return interactive_pipeline(payload, stage="requirement")
-    except Exception as e:
-        logger.exception("Pipeline start failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/pipeline/continue")
-def pipeline_continue(payload: Dict):
-    try:
-        stage = payload.get("stage")
-        if not stage:
-            raise HTTPException(status_code=400, detail="Missing stage in payload")
-        return interactive_pipeline(payload, stage=stage)
-    except Exception as e:
-        logger.exception("Pipeline continue failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
-
-from manager import manager_agent
-
-@app.post("/manager")
-def manager_route(payload: Dict):
-    return manager_agent(payload)
 

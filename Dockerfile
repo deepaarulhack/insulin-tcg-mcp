@@ -1,25 +1,32 @@
-# Use Python base image
-FROM python:3.11-slim
+# -----------------------------
+# Stage 1: Base image
+# -----------------------------
+FROM python:3.12-slim
 
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies (git, gcc)
-RUN apt-get update && apt-get install -y gcc git && rm -rf /var/lib/apt/lists/*
+# Install system dependencies (optional, for e.g. psycopg2, lxml, etc.)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+ && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency file and install
+# -----------------------------
+# Stage 2: Install dependencies
+# -----------------------------
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Clone insulin pump repo (for code context in testcase.generate)
-RUN git clone https://github.com/lmarza/Personal_Insulin_Pump-Integrated_System.git /app/insulin_repo
-
-# Copy application code
+# -----------------------------
+# Stage 3: Copy application code
+# -----------------------------
 COPY . .
 
-# Expose FastAPI on port 8080
+# -----------------------------
+# Stage 4: Expose port & run
+# -----------------------------
 EXPOSE 8080
 
-# Run with uvicorn
+# Run FastAPI with Uvicorn
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8080"]
-
